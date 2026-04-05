@@ -24,8 +24,6 @@ class Settings:
     gemini_api_key: str
     gemini_model: str
     gemini_embedding_model: str
-    groq_api_key: str
-    groq_model: str
     supabase_url: str
     supabase_key: str
 
@@ -49,8 +47,6 @@ def get_settings() -> Settings:
         gemini_embedding_model=os.getenv(
             "GEMINI_EMBEDDING_MODEL", "text-embedding-004"
         ),
-        groq_api_key=os.getenv("GROQ_API_KEY", "").strip(),
-        groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
         supabase_url=os.getenv("SUPABASE_URL", "").strip(),
         supabase_key=os.getenv("SUPABASE_KEY", "").strip(),
     )

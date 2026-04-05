@@ -140,13 +140,28 @@ class SupabaseService:
             params["plan_id"] = "eq.{0}".format(plan_id)
         if document_id:
             params["document_id"] = "eq.{0}".format(document_id)
-        return self._request("GET", "/rest/v1/drug_coverages", params=params).json()
+        rows = self._request("GET", "/rest/v1/drug_coverages", params=params).json()
+        return rows if document_id else self._filter_to_latest_document_rows(rows)
 
     def search_drug_coverages(self, drug: str, payer: Optional[str] = None, limit: int = 50) -> List[Dict]:
-        params = {"select": "*", "order": "drug_name.asc", "limit": str(limit), "drug_name": "ilike.*{0}*".format(drug)}
+        query = drug.strip().lower()
+        if not query:
+            return []
+
+        params = {"select": "*", "order": "updated_at.desc", "limit": "500"}
         if payer:
             params["payer"] = "ilike.*{0}*".format(payer)
-        return self._request("GET", "/rest/v1/drug_coverages", params=params).json()
+
+        rows = self._request("GET", "/rest/v1/drug_coverages", params=params).json()
+        rows = self._filter_to_latest_document_rows(rows)
+        matches = [row for row in rows if self._row_matches_drug_query(row, query)]
+        matches.sort(key=lambda row: (
+            -self._match_strength(row, query),
+            -(row.get("confidence_score") or 0),
+            row.get("payer") or "",
+            row.get("policy_name") or "",
+        ))
+        return matches[:limit]
 
     def compare_drug_across_payers(self, drug: str, payers: Optional[List[str]] = None, limit: int = 50) -> List[Dict]:
         rows = self.search_drug_coverages(drug=drug, limit=limit)
@@ -155,10 +170,21 @@ class SupabaseService:
             rows = filtered if filtered else rows
         seen: Dict[str, Dict] = {}
         for row in rows:
-            key = (row.get("payer") or "unknown").lower()
+            key = "|".join([
+                (row.get("payer") or "unknown").lower(),
+                str(row.get("product_key") or row.get("generic_name") or row.get("drug_name") or "").lower(),
+                str(row.get("policy_number") or row.get("policy_name") or "").lower(),
+            ])
             if key not in seen or (row.get("confidence_score") or 0) > (seen[key].get("confidence_score") or 0):
                 seen[key] = row
-        return list(seen.values())
+        return sorted(
+            seen.values(),
+            key=lambda row: (
+                row.get("payer") or "",
+                row.get("family_name") or row.get("generic_name") or row.get("drug_name") or "",
+                row.get("product_name") or "",
+            ),
+        )
 
     def replace_drug_coverages_for_document(self, document_id: str, payloads: List[DrugCoverageCreate]) -> List[Dict]:
         self._request("DELETE", "/rest/v1/drug_coverages", headers={"Prefer": "return=minimal"},
@@ -188,7 +214,7 @@ class SupabaseService:
                 "drug_name": c.get("drug_name"),
                 "section_type": c.get("section_type", "general"),
                 "page_number": c.get("page_number"),
-                "metadata": {},
+                "metadata": c.get("metadata") or {},
             }
             for c in chunks
         ]
@@ -208,9 +234,8 @@ class SupabaseService:
         seen_ids: set = set()
         rows: List[Dict] = []
 
-        # Search by drug_name and content keywords
+        # Search by tagged drug_name and chunk content keywords
         for token in tokens[:5]:
-            # Try drug_name match first
             drug_rows = self._request("GET", "/rest/v1/document_chunks", params={
                 "select": "*",
                 "drug_name": "ilike.*{0}*".format(token),
@@ -232,14 +257,18 @@ class SupabaseService:
                     rows.append(r)
                     seen_ids.add(r.get("id"))
 
-        # Prioritize non-general sections
-        rows.sort(key=lambda r: 0 if r.get("section_type") != "general" else 1)
+        # Prioritize rows where the chunk metadata carries stronger drug or policy signals.
+        rows = self._filter_to_latest_chunk_rows(rows)
+        rows.sort(key=lambda r: (
+            0 if r.get("section_type") != "general" else 1,
+            0 if (r.get("drug_name") or ((r.get("metadata") or {}).get("matched_alias"))) else 1,
+        ))
 
-        # Fallback: return recent chunks if nothing found
         if not rows:
             rows = self._request("GET", "/rest/v1/document_chunks", params={
                 "select": "*", "order": "created_at.desc", "limit": str(limit),
             }).json()
+            rows = self._filter_to_latest_chunk_rows(rows)
 
         return rows[:limit]
 
@@ -272,18 +301,24 @@ class SupabaseService:
         payers_tracked = len(set(p.get("insurer_name", "") for p in all_plans if p.get("insurer_name")))
 
         # Policies ingested (documents)
-        docs_params = {"select": "id,payer", "limit": "200"}
+        docs_params = {"select": "id,payer,policy_fingerprint,version,created_at", "limit": "200"}
         if payer:
             docs_params["payer"] = "ilike.*{0}*".format(payer)
         all_docs = self._request("GET", "/rest/v1/documents", params=docs_params).json()
-        policies_ingested = len(all_docs)
+        latest_docs = self._latest_documents(all_docs)
+        policies_ingested = len(latest_docs)
 
         # Drugs covered
-        cov_params = {"select": "drug_name,coverage_status,payer,prior_authorization,step_therapy,site_of_care", "limit": "500"}
+        cov_params = {"select": "drug_name,generic_name,product_key,payer,coverage_status,prior_authorization,step_therapy,site_of_care", "limit": "500"}
         if payer:
             cov_params["payer"] = "ilike.*{0}*".format(payer)
         all_cov = self._request("GET", "/rest/v1/drug_coverages", params=cov_params).json()
-        drugs_covered = len(set(r.get("drug_name", "") for r in all_cov if r.get("drug_name")))
+        all_cov = self._filter_to_latest_document_rows(all_cov)
+        drugs_covered = len(set(
+            (r.get("product_key") or r.get("generic_name") or r.get("drug_name") or "").strip()
+            for r in all_cov
+            if (r.get("product_key") or r.get("generic_name") or r.get("drug_name"))
+        ))
 
         # Changes this quarter
         changes_params = {"select": "id,change_type,payer,drug_name,change_date", "limit": "200"}
@@ -363,6 +398,137 @@ class SupabaseService:
             "restriction_rates": restriction_rates,
             "payer_list": sorted(payer_stats.keys()),
         }
+
+    def build_coverage_matrix(self, drug: Optional[str] = None, payers: Optional[List[str]] = None, limit: int = 500) -> Dict:
+        params = {"select": "*", "order": "payer.asc,generic_name.asc,product_name.asc", "limit": str(limit)}
+        rows = self._request("GET", "/rest/v1/drug_coverages", params=params).json()
+        rows = self._filter_to_latest_document_rows(rows)
+
+        if drug:
+            query = drug.strip().lower()
+            rows = [row for row in rows if self._row_matches_drug_query(row, query)]
+        if payers:
+            rows = [row for row in rows if any(p.lower() in (row.get("payer") or "").lower() for p in payers)]
+
+        payer_names = sorted({row.get("payer") for row in rows if row.get("payer")})
+        grouped: Dict[str, Dict] = {}
+        for row in rows:
+            key = "|".join([
+                str(row.get("family_name") or row.get("generic_name") or row.get("drug_name") or ""),
+                str(row.get("product_key") or row.get("product_name") or ""),
+            ])
+            entry = grouped.setdefault(key, {
+                "drug_name": row.get("drug_name"),
+                "generic_name": row.get("generic_name"),
+                "family_name": row.get("family_name"),
+                "product_name": row.get("product_name"),
+                "brand_names": row.get("brand_names") or [],
+                "cells": [],
+            })
+            entry["brand_names"] = list(dict.fromkeys((entry.get("brand_names") or []) + (row.get("brand_names") or [])))
+            entry["cells"].append({
+                "payer": row.get("payer") or "Unknown",
+                "policy_name": row.get("policy_name"),
+                "policy_number": row.get("policy_number"),
+                "coverage_status": row.get("coverage_status"),
+                "coverage_bucket": row.get("coverage_bucket"),
+                "prior_authorization": bool(row.get("prior_authorization")),
+                "step_therapy": bool(row.get("step_therapy")),
+                "quantity_limit": bool(row.get("quantity_limit")),
+                "notes": row.get("notes"),
+            })
+
+        return {
+            "payers": payer_names,
+            "rows": sorted(
+                grouped.values(),
+                key=lambda row: (
+                    row.get("family_name") or row.get("generic_name") or row.get("drug_name") or "",
+                    row.get("product_name") or "",
+                ),
+            ),
+        }
+
+    def _row_matches_drug_query(self, row: Dict, query: str) -> bool:
+        haystacks = [
+            row.get("drug_name"),
+            row.get("generic_name"),
+            row.get("family_name"),
+            row.get("product_name"),
+            row.get("product_key"),
+            row.get("policy_name"),
+            row.get("hcpcs_code"),
+        ]
+        haystacks.extend(row.get("brand_names") or [])
+        return any(query in str(value or "").lower() for value in haystacks)
+
+    def _match_strength(self, row: Dict, query: str) -> int:
+        ranked_values = [
+            row.get("product_name"),
+            row.get("product_key"),
+            row.get("generic_name"),
+            row.get("drug_name"),
+            row.get("family_name"),
+        ] + list(row.get("brand_names") or [])
+        for index, value in enumerate(ranked_values):
+            normalized = str(value or "").lower()
+            if not normalized:
+                continue
+            if normalized == query:
+                return 100 - index
+            if query in normalized:
+                return 75 - index
+        return 0
+
+    def _filter_to_latest_document_rows(self, rows: List[Dict]) -> List[Dict]:
+        if not rows:
+            return rows
+        latest_ids = self._latest_document_id_set()
+        filtered = []
+        for row in rows:
+            document_id = row.get("document_id")
+            if not document_id or document_id in latest_ids:
+                filtered.append(row)
+        return filtered
+
+    def _latest_document_id_set(self) -> set[str]:
+        docs = self._request(
+            "GET",
+            "/rest/v1/documents",
+            params={"select": "id,policy_fingerprint,version,created_at", "limit": "500"},
+        ).json()
+        latest = self._latest_documents(docs)
+        return {doc["id"] for doc in latest if doc.get("id")}
+
+    def _latest_documents(self, docs: List[Dict]) -> List[Dict]:
+        latest_by_group: Dict[str, Dict] = {}
+        for doc in docs:
+            group_key = str(doc.get("policy_fingerprint") or doc.get("id") or "")
+            existing = latest_by_group.get(group_key)
+            if not existing:
+                latest_by_group[group_key] = doc
+                continue
+
+            existing_version = existing.get("version") or 1
+            incoming_version = doc.get("version") or 1
+            if incoming_version > existing_version:
+                latest_by_group[group_key] = doc
+                continue
+            if incoming_version == existing_version and str(doc.get("created_at") or "") > str(existing.get("created_at") or ""):
+                latest_by_group[group_key] = doc
+
+        return list(latest_by_group.values())
+
+    def _filter_to_latest_chunk_rows(self, rows: List[Dict]) -> List[Dict]:
+        if not rows:
+            return rows
+        latest_ids = self._latest_document_id_set()
+        filtered = []
+        for row in rows:
+            document_id = row.get("document_id")
+            if not document_id or document_id in latest_ids:
+                filtered.append(row)
+        return filtered
 
     # -------------------------------------------------------------------------
     # Legacy QA helper (kept for backward compat)

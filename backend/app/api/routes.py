@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -10,8 +10,10 @@ from app.config import get_settings
 from app.schemas.document import DocumentCreate, DocumentRead
 from app.schemas.drug_coverage import (
     CompareResponse,
+    CoverageMatrixResponse,
     DiffChange,
     DiffResponse,
+    DrugReportResponse,
     DrugCoverageCreate,
     DrugCoverageRead,
     PlanCoverageEntry,
@@ -19,6 +21,8 @@ from app.schemas.drug_coverage import (
     PolicySearchResponse,
     QARequest,
     QAResponse,
+    _compact_list,
+    _compact_text,
 )
 from app.schemas.plan import PlanCreate, PlanRead
 from app.services.gemini import GeminiService
@@ -52,7 +56,7 @@ class UploadJobStatus(BaseModel):
     status: str
     file_name: str
     message: str
-    stage: str = "queued"
+    stage: Optional[str] = None
     document_id: Optional[str] = None
     result: Optional[UploadResult] = None
     error: Optional[str] = None
@@ -169,10 +173,10 @@ async def upload_policy_pdf_sync(file: UploadFile = File(...)) -> UploadResult:
     return _process_uploaded_policy_bytes(file.filename, file_bytes)
 
 
-def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progress=None) -> UploadResult:
+def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progress: Any = None) -> UploadResult:
     """Full pipeline upload helper used by both sync and background ingestion."""
 
-    def _progress(stage: str, message: str) -> None:
+    def _report(stage: str, message: str) -> None:
         if on_progress:
             on_progress(stage, message)
 
@@ -180,19 +184,19 @@ def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progres
     gemini = GeminiService(settings)
     supabase = get_supabase_service(settings)
 
-    _progress("parsing", "Parsing PDF and extracting text...")
+    _report("parsing", "Extracting text from PDF...")
     try:
         document = parse_policy_bytes(file_bytes, source_name=file_name)
     except Exception as exc:
         raise ValueError("PDF extraction failed: {0}".format(exc))
 
-    _progress("extracting", "Extracting metadata and drug coverages...")
+    _report("extracting", "Extracting drug coverages with AI...")
     try:
         bundle = run_policy_extraction(document, gemini)
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Coverage extraction failed: {0}".format(exc))
 
-    _progress("storing", "Saving to database...")
+    _report("storing", "Saving plan and document records...")
     payer = bundle.payer
     try:
         plan_id = supabase.find_or_create_plan_for_payer(
@@ -221,6 +225,7 @@ def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progres
     doc_payload = DocumentCreate(
         plan_id=plan_id,
         file_name=file_name,
+        title=bundle.document.title,
         document_type=bundle.document.document_type,
         raw_text=bundle.document.raw_text,
         status="processed",
@@ -239,8 +244,8 @@ def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progres
 
     document_id = doc_row["id"]
 
+    _report("chunking", "Saving RAG chunks...")
     # 8. Tag chunks with payer/drug metadata and save to document_chunks (RAG)
-    _progress("chunking", "Chunking text for search index...")
     tagged_chunks = bundle.tagged_chunks
     try:
         supabase.save_chunks(document_id, tagged_chunks)
@@ -255,6 +260,12 @@ def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progres
                 plan_id=plan_id,
                 document_id=document_id,
                 drug_name=item.drug_name,
+                generic_name=item.generic_name,
+                family_name=item.family_name,
+                product_name=item.product_name,
+                product_key=item.product_key,
+                policy_name=item.policy_name or bundle.plan_name or bundle.document.title,
+                document_type=item.document_type or bundle.document.document_type,
                 brand_names=item.brand_names,
                 hcpcs_code=item.hcpcs_code,
                 drug_tier=item.drug_tier,
@@ -268,6 +279,10 @@ def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progres
                 site_of_care=item.site_of_care,
                 prescriber_requirements=item.prescriber_requirements,
                 coverage_status=item.coverage_status,
+                coverage_bucket=item.coverage_bucket,
+                source_pages=item.source_pages,
+                source_section=item.source_section,
+                evidence_snippet=item.evidence_snippet,
                 notes=item.notes,
                 confidence_score=item.confidence_score,
                 payer=payer,
@@ -283,10 +298,10 @@ def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progres
         except Exception:
             pass
 
+    _report("diffing", "Checking for policy changes...")
     # 10. Auto-diff if previous version exists → save policy_changes
     changes_detected = 0
     if prev_doc and prev_doc_id:
-        _progress("diffing", "Comparing with previous version...")
         try:
             old_coverages = supabase.list_drug_coverages(document_id=prev_doc_id)
             new_coverages = supabase.list_drug_coverages(document_id=document_id)
@@ -323,7 +338,7 @@ def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progres
         except Exception:
             pass  # Non-fatal
 
-    _progress("finalizing", "Wrapping up...")
+    _report("finalizing", "Wrapping up...")
     msg = "Processed {0}: {1} drug(s), {2} chunks, {3} change(s) detected.".format(
         file_name, drugs_saved, len(tagged_chunks), changes_detected
     )
@@ -377,6 +392,7 @@ async def upload_document(
     payload = DocumentCreate(
         plan_id=plan_id,
         file_name=file.filename,
+        title=document.title,
         document_type=document_type,
         source_url=source_url,
         raw_text=document.raw_text,
@@ -426,19 +442,6 @@ def list_policy_changes(
 # Drug coverages
 # ---------------------------------------------------------------------------
 
-@router.get("/drug-coverages", response_model=List[DrugCoverageRead])
-def list_drug_coverages(
-    plan_id: Optional[str] = None,
-    document_id: Optional[str] = None,
-) -> List[DrugCoverageRead]:
-    supabase = get_supabase_service()
-    try:
-        rows = supabase.list_drug_coverages(plan_id=plan_id, document_id=document_id)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    return [DrugCoverageRead(**row) for row in rows]
-
-
 @router.get("/drugs/list")
 def list_drugs() -> List[Dict]:
     """Return unique drug names with payer counts for the search dropdown."""
@@ -451,7 +454,7 @@ def list_drugs() -> List[Dict]:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    drug_payers: Dict[str, set] = {}
+    drug_payers: Dict[str, dict] = {}
     for r in rows:
         dn = (r.get("drug_name") or "").strip()
         py = (r.get("payer") or "").strip()
@@ -466,6 +469,22 @@ def list_drugs() -> List[Dict]:
         key=lambda x: (-x["payer_count"], x["drug_name"]),
     )
     return result
+
+
+@router.get("/drug-coverages", response_model=List[DrugCoverageRead])
+def list_drug_coverages(
+    plan_id: Optional[str] = None,
+    document_id: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[DrugCoverageRead]:
+    supabase = get_supabase_service()
+    try:
+        rows = supabase.list_drug_coverages(plan_id=plan_id, document_id=document_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    if limit is not None:
+        rows = rows[:limit]
+    return [DrugCoverageRead(**row) for row in rows]
 
 
 @router.get("/search/drug", response_model=List[DrugCoverageRead])
@@ -501,14 +520,24 @@ def search_policy(
 
     policies = [PolicyCoverageRead.from_flat(row) for row in rows]
     hcpcs_code = next((p.hcpcs_code for p in policies if p.hcpcs_code), None)
-    generic_name = rows[0]["drug_name"] if rows else drug.strip()
-    unique_payers = len(set(p.payer for p in policies if p.payer))
+    generic_name = (
+        next((row.get("generic_name") for row in rows if row.get("generic_name")), None)
+        or (rows[0]["drug_name"] if rows else drug.strip())
+    )
+    policy_count = len({
+        "|".join([
+            str(row.get("payer") or ""),
+            str(row.get("policy_name") or row.get("policy_number") or ""),
+            str(row.get("product_key") or row.get("drug_name") or ""),
+        ])
+        for row in rows
+    })
 
     return PolicySearchResponse(
         drug=drug.strip(),
         generic_name=generic_name,
         hcpcs_code=hcpcs_code,
-        payer_policies_found=unique_payers,
+        payer_policies_found=policy_count,
         policies=policies,
     )
 
@@ -532,22 +561,29 @@ def compare_plans(
     entries = [
         PlanCoverageEntry(
             payer=row.get("payer"),
+            policy_name=row.get("policy_name"),
             policy_number=row.get("policy_number"),
             drug_name=row.get("drug_name", drug),
+            generic_name=row.get("generic_name"),
+            family_name=row.get("family_name"),
+            product_name=row.get("product_name"),
             brand_names=row.get("brand_names") or [],
             hcpcs_code=row.get("hcpcs_code"),
             coverage_status=row.get("coverage_status"),
+            coverage_bucket=row.get("coverage_bucket"),
             prior_authorization=row.get("prior_authorization", False),
-            prior_auth_criteria=row.get("prior_auth_criteria") or [],
+            prior_auth_criteria=_compact_list(row.get("prior_auth_criteria") or [], limit=6),
             step_therapy=row.get("step_therapy", False),
-            step_therapy_requirements=row.get("step_therapy_requirements") or [],
+            step_therapy_requirements=_compact_list(row.get("step_therapy_requirements") or [], limit=4),
             quantity_limit=row.get("quantity_limit", False),
             quantity_limit_detail=row.get("quantity_limit_detail"),
-            covered_indications=row.get("covered_indications") or [],
+            covered_indications=_compact_list(row.get("covered_indications") or [], limit=5),
             site_of_care=row.get("site_of_care") or [],
             prescriber_requirements=row.get("prescriber_requirements"),
             effective_date=row.get("effective_date"),
-            notes=row.get("notes"),
+            source_pages=row.get("source_pages") or [],
+            evidence_snippet=_compact_text(row.get("evidence_snippet"), max_len=180),
+            notes=_compact_text(row.get("notes"), max_len=320),
         )
         for row in rows
     ]
@@ -559,6 +595,59 @@ def compare_plans(
         payers_requested=payer_list,
         payers_found=payers_found,
         results=entries,
+    )
+
+
+@router.get("/coverage-matrix", response_model=CoverageMatrixResponse)
+def coverage_matrix(
+    drug: Optional[str] = None,
+    payers: Optional[str] = None,
+) -> CoverageMatrixResponse:
+    payer_list = [p.strip() for p in payers.split(",")] if payers else []
+    supabase = get_supabase_service()
+    try:
+        matrix = supabase.build_coverage_matrix(drug=drug, payers=payer_list or None)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return CoverageMatrixResponse(**matrix)
+
+
+@router.get("/reports/drug", response_model=DrugReportResponse)
+def drug_report(
+    drug: str,
+    payer: Optional[str] = None,
+    limit: int = 20,
+) -> DrugReportResponse:
+    if not drug.strip():
+        raise HTTPException(status_code=400, detail="'drug' query parameter is required.")
+
+    supabase = get_supabase_service()
+    settings = get_settings()
+    gemini = GeminiService(settings)
+    try:
+        rows = supabase.search_drug_coverages(drug=drug.strip(), payer=payer, limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    policies = [PolicyCoverageRead.from_flat(row) for row in rows]
+    payers_found = sorted({p.payer for p in policies if p.payer})
+    context_rows = rows[:12]
+    if context_rows:
+        question = "Generate a plain-English coverage report for {0}, comparing payers and highlighting coverage, prior authorization, step therapy, quantity limits, and notable restrictions.".format(drug.strip())
+        try:
+            report = gemini.ask_question(question, context_rows)
+            summary = report.get("answer") or ""
+        except Exception:
+            summary = ""
+    else:
+        summary = "No policy data found for that drug."
+
+    return DrugReportResponse(
+        drug=drug.strip(),
+        generated_summary=summary,
+        policies_found=len(policies),
+        payers_found=payers_found,
+        supporting_policies=policies,
     )
 
 
@@ -691,6 +780,12 @@ def extract_drug_coverages_from_document(document_id: str) -> List[DrugCoverageR
             plan_id=document["plan_id"],
             document_id=document["id"],
             drug_name=item.drug_name,
+            generic_name=item.generic_name,
+            family_name=item.family_name,
+            product_name=item.product_name,
+            product_key=item.product_key,
+            policy_name=item.policy_name or document.get("title"),
+            document_type=item.document_type or document.get("document_type"),
             brand_names=item.brand_names,
             hcpcs_code=item.hcpcs_code,
             drug_tier=item.drug_tier,
@@ -704,6 +799,10 @@ def extract_drug_coverages_from_document(document_id: str) -> List[DrugCoverageR
             site_of_care=item.site_of_care,
             prescriber_requirements=item.prescriber_requirements,
             coverage_status=item.coverage_status,
+            coverage_bucket=item.coverage_bucket,
+            source_pages=item.source_pages,
+            source_section=item.source_section,
+            evidence_snippet=item.evidence_snippet,
             notes=item.notes,
             confidence_score=item.confidence_score,
             payer=extracted.payer,

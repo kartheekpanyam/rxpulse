@@ -310,7 +310,9 @@ def _extract_title(pages: List[PolicyPage]) -> str:
             if idx + 1 < len(first_lines):
                 next_line = first_lines[idx + 1].strip(" .:-…")
                 if next_line:
-                    return "{0} {1}".format(cleaned, next_line).strip() if cleaned else next_line
+                    combined = "{0} {1}".format(cleaned, next_line).strip() if cleaned else next_line
+                    if len(combined) >= len(cleaned):
+                        return combined
 
     for idx, line in enumerate(first_lines):
         lowered = line.lower()
@@ -336,7 +338,17 @@ def _extract_title(pages: List[PolicyPage]) -> str:
                 -len(line),
             ),
         )
-        return prioritized[0]
+        top = prioritized[0]
+        top_index = first_lines.index(top) if top in first_lines else -1
+        if 0 <= top_index < len(first_lines) - 1:
+            next_line = first_lines[top_index + 1].strip(" .:-…")
+            if next_line and (
+                next_line[:1].islower()
+                or "products for" in next_line.lower()
+                or "indications" in next_line.lower()
+            ):
+                return "{0} {1}".format(top, next_line).strip()
+        return top
     return first_lines[0] if first_lines else "Untitled Policy"
 
 
@@ -435,6 +447,7 @@ def _extract_bcbs_program_backbone(document: PolicyDocument) -> dict:
             row = {
                 "drug_name": family,
                 "brand_names": [brand],
+                "policy_name": document.title,
                 "product_key": key,
                 "family_name": family,
                 "drug_tier": tier,
@@ -497,6 +510,7 @@ def _extract_uhc_program_backbone(document: PolicyDocument) -> dict:
         row = {
             "drug_name": generic,
             "brand_names": [brand],
+            "policy_name": document.title,
             "product_key": key,
             "family_name": "botulinum toxins",
             "drug_tier": "excluded" if key == "daxxify" else "not_applicable",

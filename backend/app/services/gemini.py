@@ -134,6 +134,7 @@ class GeminiService:
             metadata["governed_drugs"] = program_backbone.get("governed_drugs") or metadata["governed_drugs"]
 
         if not self.is_configured or self._metadata_is_sufficient(metadata):
+            metadata["governed_drugs"] = self._refine_governed_drugs(document, metadata)
             return metadata
 
         prompt = self._build_metadata_prompt(document, metadata)
@@ -148,6 +149,7 @@ class GeminiService:
             metadata["primary_drug"] = result.get("primary_drug") or metadata["primary_drug"]
             metadata["governed_drugs"] = result.get("governed_drugs") or metadata["governed_drugs"]
 
+        metadata["governed_drugs"] = self._refine_governed_drugs(document, metadata)
         return metadata
 
     def extract_policy_coverages(
@@ -293,11 +295,18 @@ class GeminiService:
                 existing[field] = merged
 
         scalar_fields = [
+            "generic_name",
+            "family_name",
+            "product_name",
+            "product_key",
+            "policy_name",
+            "document_type",
             "hcpcs_code",
             "drug_tier",
             "quantity_limit_detail",
             "prescriber_requirements",
             "coverage_status",
+            "coverage_bucket",
             "notes",
             "evidence_snippet",
             "source_section",
@@ -326,10 +335,23 @@ class GeminiService:
     # RAG helpers
     # -------------------------------------------------------------------------
 
-    def tag_chunks_for_rag(self, chunks: List[Dict], payer: str, primary_drug: Optional[str] = None) -> List[Dict]:
+    def tag_chunks_for_rag(
+        self,
+        chunks: List[Dict],
+        payer: str,
+        metadata: Optional[Dict[str, object]] = None,
+        primary_drug: Optional[str] = None,
+    ) -> List[Dict]:
+        metadata = metadata or {}
         for chunk in chunks:
             chunk["payer"] = payer
-            chunk.setdefault("drug_name", primary_drug)
+            tagged_drug, matched_alias = self._infer_chunk_drug(chunk.get("content") or "", metadata, primary_drug)
+            chunk["drug_name"] = tagged_drug or primary_drug
+            chunk["metadata"] = {
+                "matched_alias": matched_alias,
+                "policy_name": metadata.get("plan_name") or metadata.get("policy_scope"),
+                "document_type": metadata.get("document_type"),
+            }
         return chunks
 
     def _identify_drug_in_chunk(self, text: str) -> Optional[str]:
@@ -382,22 +404,17 @@ class GeminiService:
             if drug:
                 drugs_found.add(drug)
 
-        prompt = """You are RxPulse, a medical benefit drug policy assistant built for healthcare analysts at Anton Rx.
-You help analysts understand coverage rules for provider-administered drugs (infusions, injectables) across health plan medical policies.
+        prompt = """You are RxPulse, a medical benefit drug policy assistant for healthcare analysts.
+Answer the question using ONLY the policy text provided below.
+Always cite the specific payer name in your answer.
+Be concise and specific. Use bullet points when comparing multiple payers.
+Do not use markdown bold (**) or headers - plain text only.
+If the data does not contain enough information, say so clearly - never invent coverage rules.
 
-Rules:
-- Answer using ONLY the policy text provided below. Never invent or assume coverage rules.
-- Always cite the specific payer/health plan name when stating a coverage rule.
-- When comparing across payers, use bullet points with the payer name leading each point.
-- Use plain text only — no markdown bold, headers, or formatting.
-- If the policy text does not contain enough information to answer, say so clearly and suggest what to search for.
-- Keep answers concise and actionable for an analyst audience.
-- When discussing prior auth criteria, step therapy, or site-of-care restrictions, be specific about what the policy requires.
-
-Policy text from ingested documents:
+Policy text:
 {context}
 
-Analyst question: {question}""".format(context="\n\n---\n\n".join(context_parts), question=question)
+Question: {question}""".format(context="\n\n---\n\n".join(context_parts), question=question)
 
         try:
             answer = self._request_text(prompt, temperature=0.2, timeout=self.REQUEST_TIMEOUT_SECONDS)
@@ -812,6 +829,9 @@ Chunk text:
                 pages_for_product = self._find_relevant_pages_for_product(document, brand, generic_name)
                 row = {
                     "drug_name": generic_name or self._canonicalize_name(brand),
+                    "generic_name": generic_name or self._canonicalize_name(brand),
+                    "family_name": generic_name or self._canonicalize_name(brand),
+                    "product_name": brand,
                     "brand_names": [brand],
                     "hcpcs_code": self._find_code_for_product(brand, generic_name, key_text, jcode_map),
                     "drug_tier": self._infer_program_tier(brand, generic_name, pages),
@@ -831,9 +851,12 @@ Chunk text:
                     "source_section": "coverage",
                     "evidence_snippet": self._extract_evidence_snippet(brand, generic_name, pages),
                     "product_key": self._canonicalize_name(brand, preserve_brand=True),
+                    "policy_name": metadata.get("plan_name") or document.title,
+                    "document_type": "program_policy",
                 }
                 self._apply_program_policy_overrides(document, row)
                 row["coverage_status"] = self._normalize_coverage_status(row)
+                row["coverage_bucket"] = self._derive_coverage_bucket(row)
                 rows.append(row)
 
         return rows
@@ -854,6 +877,9 @@ Chunk text:
 
         normalized = {
             "drug_name": drug_name,
+            "generic_name": self._canonicalize_name(row.get("generic_name") or drug_name),
+            "family_name": self._canonicalize_name(row.get("family_name") or drug_name),
+            "product_name": self._normalize_optional_string(row.get("product_name")) or (brand_names[0] if brand_names else None),
             "brand_names": list(dict.fromkeys(brand_names)),
             "hcpcs_code": self._normalize_jcode(row.get("hcpcs_code")) or self._normalize_optional_string(row.get("hcpcs_code")),
             "drug_tier": row.get("drug_tier"),
@@ -867,12 +893,15 @@ Chunk text:
             "site_of_care": self._normalize_site_of_care(row.get("site_of_care") or []),
             "prescriber_requirements": self._normalize_optional_string(row.get("prescriber_requirements")),
             "coverage_status": self._normalize_coverage_status(row),
+            "coverage_bucket": row.get("coverage_bucket") or self._derive_coverage_bucket(row),
             "notes": notes,
             "confidence_score": min(max(float(row.get("confidence_score") or 0.85), 0.0), 1.0),
             "source_pages": [int(p) for p in (row.get("source_pages") or [1]) if isinstance(p, int)],
             "source_section": row.get("source_section") or "coverage",
             "evidence_snippet": self._normalize_optional_string(row.get("evidence_snippet")),
             "product_key": row.get("product_key") or self._derive_product_key(brand_names, "program_policy"),
+            "policy_name": self._normalize_optional_string(row.get("policy_name")),
+            "document_type": row.get("document_type") or "program_policy",
         }
         return normalized
 
@@ -953,6 +982,12 @@ Chunk text:
 
         normalized = {
             "drug_name": canonical_drug,
+            "generic_name": self._canonicalize_name(candidate.get("generic_name") or canonical_drug),
+            "family_name": self._canonicalize_name(candidate.get("family_name") or canonical_drug),
+            "product_name": self._normalize_optional_string(candidate.get("product_name")) or (brand_names[0] if brand_names else drug_name or canonical_drug),
+            "product_key": candidate.get("product_key") or self._derive_product_key(brand_names, document_type),
+            "policy_name": self._normalize_optional_string(candidate.get("policy_name")),
+            "document_type": document_type,
             "brand_names": list(dict.fromkeys(brand_names)),
             "hcpcs_code": self._normalize_jcode(candidate.get("hcpcs_code")),
             "drug_tier": candidate.get("drug_tier"),
@@ -966,12 +1001,12 @@ Chunk text:
             "site_of_care": self._normalize_site_of_care(candidate.get("site_of_care") or []),
             "prescriber_requirements": self._normalize_optional_string(candidate.get("prescriber_requirements")),
             "coverage_status": self._normalize_coverage_status(candidate),
+            "coverage_bucket": self._derive_coverage_bucket(candidate),
             "notes": self._normalize_optional_string(candidate.get("notes")),
             "confidence_score": min(max(float(candidate.get("confidence_score") or 0.5), 0.0), 1.0),
             "source_pages": source_pages,
             "source_section": candidate.get("source_section") or chunk.get("section_type") or "general",
             "evidence_snippet": self._normalize_optional_string(candidate.get("evidence_snippet")),
-            "product_key": candidate.get("product_key") or self._derive_product_key(brand_names, document_type),
         }
 
         if not normalized["hcpcs_code"]:
@@ -1150,6 +1185,12 @@ Chunk text:
 
         return {
             "drug_name": candidate.get("drug_name"),
+            "generic_name": candidate.get("generic_name") or candidate.get("drug_name"),
+            "family_name": candidate.get("family_name") or candidate.get("generic_name") or candidate.get("drug_name"),
+            "product_name": candidate.get("product_name"),
+            "product_key": candidate.get("product_key"),
+            "policy_name": candidate.get("policy_name"),
+            "document_type": candidate.get("document_type"),
             "brand_names": candidate.get("brand_names") or [],
             "hcpcs_code": candidate.get("hcpcs_code"),
             "drug_tier": candidate.get("drug_tier"),
@@ -1163,6 +1204,10 @@ Chunk text:
             "site_of_care": candidate.get("site_of_care") or [],
             "prescriber_requirements": candidate.get("prescriber_requirements"),
             "coverage_status": candidate.get("coverage_status"),
+            "coverage_bucket": candidate.get("coverage_bucket") or self._derive_coverage_bucket(candidate),
+            "source_pages": candidate.get("source_pages") or [],
+            "source_section": candidate.get("source_section"),
+            "evidence_snippet": candidate.get("evidence_snippet"),
             "notes": notes or None,
             "confidence_score": float(candidate.get("confidence_score") or 0.5),
         }
@@ -1307,6 +1352,37 @@ Chunk text:
             })
         return results
 
+    def _refine_governed_drugs(self, document: PolicyDocument, metadata: Dict[str, object]) -> List[dict]:
+        governed = metadata.get("governed_drugs") or []
+        normalized = []
+        seen = set()
+
+        for item in governed:
+            if not isinstance(item, dict):
+                continue
+            drug_name = self._canonicalize_name(item.get("drug_name") or "")
+            brand_names = [
+                brand.strip()
+                for brand in (item.get("brand_names") or [])
+                if isinstance(brand, str) and brand.strip()
+            ]
+            key = (drug_name, tuple(sorted(brand_names)))
+            if not drug_name or key in seen:
+                continue
+            seen.add(key)
+            normalized.append({
+                "drug_name": drug_name,
+                "brand_names": list(dict.fromkeys(brand_names)),
+            })
+
+        if normalized:
+            return normalized
+
+        primary = self._canonicalize_name(str(metadata.get("primary_drug") or ""))
+        if primary:
+            return [{"drug_name": primary, "brand_names": []}]
+        return self._infer_governed_drugs_heuristic(document)
+
     def _metadata_is_sufficient(self, metadata: Dict[str, object]) -> bool:
         payer = metadata.get("payer")
         document_type = metadata.get("document_type")
@@ -1373,6 +1449,37 @@ Chunk text:
         if brand_names:
             return self._canonicalize_name(brand_names[0], preserve_brand=True)
         return None
+
+    def _infer_chunk_drug(
+        self,
+        content: str,
+        metadata: Dict[str, object],
+        primary_drug: Optional[str],
+    ) -> tuple[Optional[str], Optional[str]]:
+        lowered = content.lower()
+        for item in metadata.get("governed_drugs") or []:
+            if not isinstance(item, dict):
+                continue
+            family = self._canonicalize_name(item.get("drug_name") or "")
+            aliases = [family]
+            aliases.extend(self._canonicalize_name(brand, preserve_brand=True) for brand in (item.get("brand_names") or []))
+            aliases.extend(self._canonicalize_name(brand) for brand in (item.get("brand_names") or []))
+            for alias in aliases:
+                if alias and alias in lowered:
+                    return family or primary_drug, alias
+        return primary_drug, None
+
+    def _derive_coverage_bucket(self, candidate: dict) -> str:
+        coverage_status = self._normalize_coverage_status(candidate)
+        if coverage_status == "not_covered":
+            return "not_covered"
+        if candidate.get("step_therapy"):
+            return "step_therapy"
+        if candidate.get("prior_authorization"):
+            return "pa_required"
+        if coverage_status == "restricted":
+            return "restricted"
+        return "covered"
 
     def _tokenize_name(self, value: str) -> List[str]:
         return [piece for piece in re.findall(r"[a-z0-9]+", value.lower()) if len(piece) >= 4]

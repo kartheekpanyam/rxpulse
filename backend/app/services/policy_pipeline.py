@@ -49,7 +49,7 @@ def run_policy_extraction(document: PolicyDocument, gemini: GeminiService) -> Po
     primary_drug = metadata.get("primary_drug")
 
     chunks = build_rag_chunks(document)
-    tagged_chunks = gemini.tag_chunks_for_rag(chunks, payer, primary_drug=primary_drug)
+    tagged_chunks = gemini.tag_chunks_for_rag(chunks, payer, metadata=metadata, primary_drug=primary_drug)
 
     return PolicyExtractionBundle(
         document=document,

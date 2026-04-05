@@ -5,8 +5,46 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+def _unique_strings(values: List[str]) -> List[str]:
+    cleaned = []
+    seen = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return cleaned
+
+
+def _compact_list(values: List[str], limit: int) -> List[str]:
+    deduped = _unique_strings(values)
+    if len(deduped) <= limit:
+        return deduped
+    remaining = len(deduped) - limit
+    return deduped[:limit] + ["... and {0} more".format(remaining)]
+
+
+def _compact_text(value: Optional[str], max_len: int = 280) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
 class DrugCoverageExtractedItem(BaseModel):
     drug_name: str
+    generic_name: Optional[str] = None
+    family_name: Optional[str] = None
+    product_name: Optional[str] = None
+    product_key: Optional[str] = None
+    policy_name: Optional[str] = None
+    document_type: Optional[str] = None
     brand_names: List[str] = Field(default_factory=list)
     hcpcs_code: Optional[str] = None
     drug_tier: Optional[str] = None
@@ -20,6 +58,10 @@ class DrugCoverageExtractedItem(BaseModel):
     site_of_care: List[str] = Field(default_factory=list)
     prescriber_requirements: Optional[str] = None
     coverage_status: Optional[str] = None
+    coverage_bucket: Optional[str] = None
+    source_pages: List[int] = Field(default_factory=list)
+    source_section: Optional[str] = None
+    evidence_snippet: Optional[str] = None
     notes: Optional[str] = None
     confidence_score: float = Field(default=0.5, ge=0.0, le=1.0)
 
@@ -36,6 +78,12 @@ class DrugCoverageCreate(BaseModel):
     plan_id: str
     document_id: Optional[str] = None
     drug_name: str
+    generic_name: Optional[str] = None
+    family_name: Optional[str] = None
+    product_name: Optional[str] = None
+    product_key: Optional[str] = None
+    policy_name: Optional[str] = None
+    document_type: Optional[str] = None
     brand_names: List[str] = Field(default_factory=list)
     hcpcs_code: Optional[str] = None
     drug_tier: Optional[str] = None
@@ -49,6 +97,10 @@ class DrugCoverageCreate(BaseModel):
     site_of_care: List[str] = Field(default_factory=list)
     prescriber_requirements: Optional[str] = None
     coverage_status: Optional[str] = None
+    coverage_bucket: Optional[str] = None
+    source_pages: List[int] = Field(default_factory=list)
+    source_section: Optional[str] = None
+    evidence_snippet: Optional[str] = None
     notes: Optional[str] = None
     confidence_score: float = Field(default=0.5, ge=0.0, le=1.0)
     payer: Optional[str] = None
@@ -85,9 +137,13 @@ class PolicyCoverageRead(BaseModel):
     effective_date: Optional[str] = None
     last_updated: Optional[str] = None
     drug_name: str
+    generic_name: Optional[str] = None
+    family_name: Optional[str] = None
+    product_name: Optional[str] = None
     brand_names: List[str] = Field(default_factory=list)
     hcpcs_code: Optional[str] = None
     coverage_status: Optional[str] = None
+    coverage_bucket: Optional[str] = None
     covered_indications: List[str] = Field(default_factory=list)
     prior_auth_required: bool = False
     pa_criteria: List[str] = Field(default_factory=list)
@@ -98,6 +154,8 @@ class PolicyCoverageRead(BaseModel):
     quantity_limit: bool = False
     quantity_limit_detail: Optional[str] = None
     reauthorization_interval: Optional[str] = None
+    evidence_snippet: Optional[str] = None
+    source_pages: List[int] = Field(default_factory=list)
     confidence_score: float = 0.5
 
     @classmethod
@@ -105,7 +163,7 @@ class PolicyCoverageRead(BaseModel):
         """Build a PolicyCoverageRead from a raw DrugCoverageRead dict."""
         # Step therapy: bool + requirements list → nested shape
         step_required = bool(row.get("step_therapy", False))
-        step_reqs = row.get("step_therapy_requirements") or []
+        step_reqs = _compact_list(row.get("step_therapy_requirements") or [], limit=4)
         step_details = "; ".join(step_reqs) if step_reqs else ("Required" if step_required else "")
 
         # Site of care: flat list → structured shape
@@ -118,7 +176,7 @@ class PolicyCoverageRead(BaseModel):
         # policy_name: derive from payer + drug if not stored
         payer = row.get("payer") or ""
         drug = row.get("drug_name", "")
-        policy_name = "{0} — {1}".format(payer, drug) if payer else drug
+        policy_name = row.get("policy_name") or ("{0} — {1}".format(payer, drug) if payer else drug)
 
         return cls(
             policy_id=row.get("id", ""),
@@ -128,18 +186,24 @@ class PolicyCoverageRead(BaseModel):
             effective_date=row.get("effective_date"),
             last_updated=row.get("last_reviewed_date") or row.get("updated_at"),
             drug_name=drug,
+            generic_name=row.get("generic_name"),
+            family_name=row.get("family_name"),
+            product_name=row.get("product_name"),
             brand_names=row.get("brand_names") or [],
             hcpcs_code=row.get("hcpcs_code"),
             coverage_status=row.get("coverage_status"),
-            covered_indications=row.get("covered_indications") or [],
+            coverage_bucket=row.get("coverage_bucket"),
+            covered_indications=_compact_list(row.get("covered_indications") or [], limit=6),
             prior_auth_required=bool(row.get("prior_authorization", False)),
-            pa_criteria=row.get("prior_auth_criteria") or [],
+            pa_criteria=_compact_list(row.get("prior_auth_criteria") or [], limit=8),
             step_therapy=StepTherapyShape(required=step_required, details=step_details),
             site_of_care=SiteOfCareShape(allowed=allowed, restricted=[], preferred=preferred),
-            clinical_criteria=row.get("prior_auth_criteria") or [],
+            clinical_criteria=_compact_list(row.get("prior_auth_criteria") or [], limit=5),
             prescriber_requirements=row.get("prescriber_requirements"),
             quantity_limit=bool(row.get("quantity_limit", False)),
             quantity_limit_detail=row.get("quantity_limit_detail"),
+            evidence_snippet=_compact_text(row.get("evidence_snippet"), max_len=220),
+            source_pages=(row.get("source_pages") or [])[:8],
             confidence_score=float(row.get("confidence_score") or 0.5),
         )
 
@@ -166,11 +230,16 @@ class QAResponse(BaseModel):
 
 class PlanCoverageEntry(BaseModel):
     payer: Optional[str] = None
+    policy_name: Optional[str] = None
     policy_number: Optional[str] = None
     drug_name: str
+    generic_name: Optional[str] = None
+    family_name: Optional[str] = None
+    product_name: Optional[str] = None
     brand_names: List[str] = Field(default_factory=list)
     hcpcs_code: Optional[str] = None
     coverage_status: Optional[str] = None
+    coverage_bucket: Optional[str] = None
     prior_authorization: bool = False
     prior_auth_criteria: List[str] = Field(default_factory=list)
     step_therapy: bool = False
@@ -181,6 +250,8 @@ class PlanCoverageEntry(BaseModel):
     site_of_care: List[str] = Field(default_factory=list)
     prescriber_requirements: Optional[str] = None
     effective_date: Optional[str] = None
+    source_pages: List[int] = Field(default_factory=list)
+    evidence_snippet: Optional[str] = None
     notes: Optional[str] = None
 
 
@@ -189,6 +260,40 @@ class CompareResponse(BaseModel):
     payers_requested: List[str] = Field(default_factory=list)
     payers_found: List[str] = Field(default_factory=list)
     results: List[PlanCoverageEntry] = Field(default_factory=list)
+
+
+class CoverageMatrixCell(BaseModel):
+    payer: str
+    policy_name: Optional[str] = None
+    policy_number: Optional[str] = None
+    coverage_status: Optional[str] = None
+    coverage_bucket: Optional[str] = None
+    prior_authorization: bool = False
+    step_therapy: bool = False
+    quantity_limit: bool = False
+    notes: Optional[str] = None
+
+
+class CoverageMatrixRow(BaseModel):
+    drug_name: str
+    generic_name: Optional[str] = None
+    family_name: Optional[str] = None
+    product_name: Optional[str] = None
+    brand_names: List[str] = Field(default_factory=list)
+    cells: List[CoverageMatrixCell] = Field(default_factory=list)
+
+
+class CoverageMatrixResponse(BaseModel):
+    payers: List[str] = Field(default_factory=list)
+    rows: List[CoverageMatrixRow] = Field(default_factory=list)
+
+
+class DrugReportResponse(BaseModel):
+    drug: str
+    generated_summary: str
+    policies_found: int = 0
+    payers_found: List[str] = Field(default_factory=list)
+    supporting_policies: List[PolicyCoverageRead] = Field(default_factory=list)
 
 
 class DiffChange(BaseModel):

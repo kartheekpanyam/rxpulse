@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
 import PolicyCard from './PolicyCard'
 
-const API = import.meta.env.VITE_API_BASE_URL
+const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1'
 
 export default function DrugSearch() {
   const [drug, setDrug] = useState('')

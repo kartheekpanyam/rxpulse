@@ -8,6 +8,7 @@ from pydantic import BaseModel
 class DocumentCreate(BaseModel):
     plan_id: str
     file_name: str
+    title: Optional[str] = None
     file_url: Optional[str] = None
     document_type: str = "formulary"
     source_url: Optional[str] = None
