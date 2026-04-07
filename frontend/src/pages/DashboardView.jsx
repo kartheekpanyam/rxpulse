@@ -1,8 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import axios from 'axios'
-
-const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1'
+import { getStats, getPolicyChanges, uploadPolicy, getUploadJob } from '../api'
 
 const STAGE_LABELS = {
   queued: 'Queued',
@@ -42,15 +40,15 @@ export default function DashboardView() {
   const fetchStats = useCallback((payer) => {
     setLoadingStats(true)
     const params = payer && payer !== 'All' ? { payer } : {}
-    axios.get(`${API}/stats`, { params })
-      .then(res => setStats(res.data))
+    getStats(params)
+      .then(data => setStats(data))
       .catch(() => setStats(null))
       .finally(() => setLoadingStats(false))
   }, [])
 
   const fetchChanges = useCallback(() => {
-    axios.get(`${API}/policy-changes`, { params: { limit: 5 } })
-      .then(res => setRecentChanges(res.data || []))
+    getPolicyChanges({ limit: 5 })
+      .then(data => setRecentChanges(data || []))
       .catch(() => setRecentChanges([]))
   }, [])
 
@@ -84,9 +82,8 @@ export default function DashboardView() {
 
   const pollJob = (jobId) => {
     pollRef.current = setInterval(() => {
-      axios.get(`${API}/upload/jobs/${jobId}`)
-        .then(res => {
-          const job = res.data
+      getUploadJob(jobId)
+        .then(job => {
           setUploadStage(job.stage || job.status)
           setUploadMessage(job.message || '')
 
@@ -129,8 +126,8 @@ export default function DashboardView() {
     formData.append('file', uploadFile)
 
     try {
-      const res = await axios.post(`${API}/upload`, formData)
-      const jobId = res.data.job_id
+      const data = await uploadPolicy(formData)
+      const jobId = data.job_id
       setUploadStage('starting')
       setUploadMessage('Processing started...')
       pollJob(jobId)

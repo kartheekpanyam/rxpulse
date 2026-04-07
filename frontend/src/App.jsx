@@ -5,6 +5,7 @@ import AskView from './pages/AskView'
 import HeatmapView from './pages/HeatmapView'
 import PathwayView from './pages/PathwayView'
 import ReportView from './pages/ReportView'
+import PolicyTimeline from './components/Map/CoverageMap'
 
 const navLink = ({ isActive }) =>
   `px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
@@ -27,6 +28,7 @@ function App() {
           <NavLink to="/matrix" className={navLink}>Coverage Matrix</NavLink>
           <NavLink to="/pathway" className={navLink}>Coverage Pathway</NavLink>
           <NavLink to="/report" className={navLink}>Reports</NavLink>
+          <NavLink to="/changes" className={navLink}>Policy Changes</NavLink>
           <NavLink to="/ask" className={navLink}>AI Assistant</NavLink>
         </nav>
 
@@ -37,6 +39,7 @@ function App() {
           <Route path="/matrix" element={<HeatmapView />} />
           <Route path="/pathway" element={<PathwayView />} />
           <Route path="/report" element={<ReportView />} />
+          <Route path="/changes" element={<PolicyTimeline />} />
           <Route path="/ask" element={<AskView />} />
         </Routes>
       </div>

@@ -1,7 +1,5 @@
 import { useState, useEffect } from 'react'
-import axios from 'axios'
-
-const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1'
+import { getStats, getDrugCoverages, searchPolicy } from '../api'
 
 const MAX_CRITERIA = 5
 
@@ -83,9 +81,9 @@ export default function PathwayView() {
 
   // Load payer list
   useEffect(() => {
-    axios.get(`${API}/stats`)
-      .then(res => {
-        const list = res.data.payer_list || []
+    getStats()
+      .then(data => {
+        const list = data.payer_list || []
         setPayers(list)
         if (list.length > 0) setSelectedPayer(list[0])
       })
@@ -95,9 +93,9 @@ export default function PathwayView() {
   // Load drugs for selected payer (deduped by generic name)
   useEffect(() => {
     if (!selectedPayer) return
-    axios.get(`${API}/drug-coverages`, { params: { limit: 200 } })
-      .then(res => {
-        const rows = res.data || []
+    getDrugCoverages({ limit: 200 })
+      .then(data => {
+        const rows = data || []
         const payerDrugs = rows
           .filter(r => (r.payer || '').toLowerCase() === selectedPayer.toLowerCase())
           .map(r => r.drug_name)
@@ -111,8 +109,8 @@ export default function PathwayView() {
   // Load policy for selected drug
   useEffect(() => {
     if (!selectedDrug) { setPolicies([]); return }
-    axios.get(`${API}/search/policy`, { params: { drug: selectedDrug } })
-      .then(res => setPolicies(res.data.policies || []))
+    searchPolicy({ drug: selectedDrug })
+      .then(data => setPolicies(data.policies || []))
       .catch(() => setPolicies([]))
   }, [selectedDrug])
 

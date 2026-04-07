@@ -1,7 +1,5 @@
 import { useState, useEffect, useMemo } from 'react'
-import axios from 'axios'
-
-const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1'
+import { getDrugCoverages } from '../api'
 
 const STATUS = {
   covered:     { label: 'Covered',     short: 'C', bg: 'bg-[#4CAF50]', textColor: 'text-white' },
@@ -79,6 +77,29 @@ function normalizeStatus(raw) {
   return 'restricted'
 }
 
+function exportMatrixCSV(drugs, payers, matrix) {
+  const header = ['Drug', 'HCPCS', ...payers]
+  const rows = drugs.map(drug => {
+    const cells = payers.map(payer => {
+      const cell = matrix[`${drug.generic}|${payer}`]
+      if (!cell) return ''
+      let val = cell.status
+      if (cell.pa) val += ' (PA)'
+      if (cell.step) val += ' (ST)'
+      return val
+    })
+    return [drug.name, drug.code || '', ...cells]
+  })
+  const csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n')
+  const blob = new Blob([csv], { type: 'text/csv' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = 'coverage_matrix.csv'
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 export default function HeatmapView() {
   const [loading, setLoading]     = useState(true)
   const [drugs, setDrugs]         = useState([])
@@ -88,9 +109,9 @@ export default function HeatmapView() {
   const [hasData, setHasData]     = useState(false)
 
   useEffect(() => {
-    axios.get(`${API}/drug-coverages`)
-      .then(res => {
-        const rows = res.data || []
+    getDrugCoverages()
+      .then(data => {
+        const rows = data || []
         if (rows.length > 0) {
           const built = buildMatrix(rows)
           setDrugs(built.drugs)
@@ -128,15 +149,21 @@ export default function HeatmapView() {
           </p>
         </div>
         {hasData && stats.total > 0 && (
-          <div className="flex gap-5 text-center">
-            <div>
-              <p className="text-xl font-bold text-[var(--color-success)]">{Math.round((stats.covered / stats.total) * 100)}%</p>
-              <p className="theme-muted text-xs">Covered</p>
+          <div className="flex items-center gap-5">
+            <div className="flex gap-5 text-center">
+              <div>
+                <p className="text-xl font-bold text-[var(--color-success)]">{Math.round((stats.covered / stats.total) * 100)}%</p>
+                <p className="theme-muted text-xs">Covered</p>
+              </div>
+              <div>
+                <p className="text-xl font-bold text-[var(--color-warning)]">{Math.round((stats.restricted / stats.total) * 100)}%</p>
+                <p className="theme-muted text-xs">Restricted</p>
+              </div>
             </div>
-            <div>
-              <p className="text-xl font-bold text-[var(--color-warning)]">{Math.round((stats.restricted / stats.total) * 100)}%</p>
-              <p className="theme-muted text-xs">Restricted</p>
-            </div>
+            <button onClick={() => exportMatrixCSV(drugs, payers, matrix)}
+              className="theme-button-secondary px-4 py-2 rounded-lg text-sm">
+              Export CSV
+            </button>
           </div>
         )}
       </div>

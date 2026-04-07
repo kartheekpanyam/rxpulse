@@ -1,8 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import axios from 'axios'
 import PolicyCard from './PolicyCard'
-
-const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1'
+import { getDrugsList, searchPolicy } from '../../api'
 
 export default function DrugSearch() {
   const [drug, setDrug] = useState('')
@@ -18,8 +16,8 @@ export default function DrugSearch() {
 
   // Fetch drug list on mount
   useEffect(() => {
-    axios.get(`${API}/drugs/list`)
-      .then(res => setDrugList(res.data || []))
+    getDrugsList()
+      .then(data => setDrugList(data || []))
       .catch(() => setDrugList([]))
   }, [])
 
@@ -51,9 +49,7 @@ export default function DrugSearch() {
     setError(null)
     setShowDropdown(false)
     try {
-      const { data } = await axios.get(`${API}/search/policy`, {
-        params: { drug: drugName }
-      })
+      const data = await searchPolicy({ drug: drugName })
       setResults(data)
     } catch (err) {
       setError(err.response?.data?.detail || 'Search failed. Make sure the backend is running.')

@@ -1,7 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import axios from 'axios'
-
-const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1'
+import { getDrugsList, comparePlans, askQuestion } from '../api'
 
 const MAX_INDICATIONS = 5
 
@@ -58,6 +56,34 @@ function deriveKeyDifferences(payerData) {
   return diffs
 }
 
+function exportReportCSV(drug, payerData) {
+  const payers = Object.keys(payerData)
+  const dimensions = ['Coverage Status', 'Covered Indications', 'Prior Authorization', 'Step Therapy', 'Approved Sites', 'Quantity Limit', 'Effective Date']
+  const getField = (p, dim) => {
+    const d = payerData[p]
+    switch (dim) {
+      case 'Coverage Status': return d.coverage_status
+      case 'Covered Indications': return (d.covered_indications || []).join('; ')
+      case 'Prior Authorization': return d.pa
+      case 'Step Therapy': return d.step_therapy
+      case 'Approved Sites': return (d.sites || []).join('; ')
+      case 'Quantity Limit': return d.quantity_limit
+      case 'Effective Date': return d.updated
+      default: return ''
+    }
+  }
+  const header = ['Dimension', ...payers]
+  const rows = dimensions.map(dim => [dim, ...payers.map(p => getField(p, dim))])
+  const csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n')
+  const blob = new Blob([csv], { type: 'text/csv' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${drug}_report.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 const STATUS_STYLES = {
   covered: 'bg-[#EDF7ED] text-[#2E7D32]',
   restricted: 'bg-[#FFF8E1] text-[#E65100]',
@@ -80,8 +106,8 @@ export default function ReportView() {
 
   // Load drug list for dropdown
   useEffect(() => {
-    axios.get(`${API}/drugs/list`)
-      .then(res => setDrugList(res.data || []))
+    getDrugsList()
+      .then(data => setDrugList(data || []))
       .catch(() => setDrugList([]))
   }, [])
 
@@ -111,8 +137,8 @@ export default function ReportView() {
     setReportDrug('')
 
     try {
-      const compareRes = await axios.get(`${API}/compare/plans`, { params: { drug } })
-      const results = compareRes.data.results || []
+      const compareData = await comparePlans({ drug })
+      const results = compareData.results || []
 
       if (results.length === 0) {
         setError('No policy data found for this drug.')
@@ -128,10 +154,8 @@ export default function ReportView() {
       let aiSummary = ''
       const payerNames = Object.keys(payers)
       try {
-        const qaRes = await axios.post(`${API}/qa/ask`, {
-          question: `For ${drug}, provide a 2-3 sentence executive summary of coverage across ${payerNames.join(', ')}. Focus on key differences in access requirements.`,
-        })
-        aiSummary = (qaRes.data.answer || '').replace(/\*\*(.*?)\*\*/g, '$1').replace(/^#{1,6}\s+/gm, '').trim()
+        const qaData = await askQuestion(`For ${drug}, provide a 2-3 sentence executive summary of coverage across ${payerNames.join(', ')}. Focus on key differences in access requirements.`)
+        aiSummary = (qaData.answer || '').replace(/\*\*(.*?)\*\*/g, '$1').replace(/^#{1,6}\s+/gm, '').trim()
       } catch {
         aiSummary = `${drug} is covered by ${payerNames.length} payer(s): ${payerNames.join(', ')}.`
       }
@@ -213,10 +237,16 @@ export default function ReportView() {
                   <span className="theme-pill text-xs px-2 py-0.5 rounded-full">{payerNames.length} payer{payerNames.length !== 1 ? 's' : ''}</span>
                 </div>
               </div>
-              <button onClick={() => window.print()}
-                className="theme-button-secondary px-4 py-2 rounded-lg text-sm print:hidden">
-                Export PDF
-              </button>
+              <div className="flex gap-2 print:hidden">
+                <button onClick={() => exportReportCSV(reportDrug, payerData)}
+                  className="theme-button-secondary px-4 py-2 rounded-lg text-sm">
+                  Export CSV
+                </button>
+                <button onClick={() => window.print()}
+                  className="theme-button-secondary px-4 py-2 rounded-lg text-sm">
+                  Export PDF
+                </button>
+              </div>
             </div>
             {summary && (
               <div className="mt-4 pt-4 border-t border-[var(--color-border)]">

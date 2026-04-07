@@ -1,14 +1,12 @@
 import { useState, useEffect, useMemo } from 'react'
-import axios from 'axios'
-
-const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1'
+import { getPolicyChanges } from '../../api'
 
 const CHANGE_TYPES = {
-  criteria_updated:  { label: 'Criteria Updated',   bg: 'bg-amber-900/50 text-amber-300',  border: 'border-amber-700' },
-  restriction_added: { label: 'Restriction Added',  bg: 'bg-red-900/50 text-red-300',     border: 'border-red-700' },
-  new_coverage:      { label: 'New Coverage',        bg: 'bg-green-900/50 text-green-300', border: 'border-green-700' },
-  coverage_expanded: { label: 'Coverage Expanded',  bg: 'bg-blue-900/50 text-blue-300',   border: 'border-blue-700' },
-  coverage_removed:  { label: 'Coverage Removed',   bg: 'bg-purple-900/50 text-purple-300', border: 'border-purple-700' },
+  criteria_updated:  { label: 'Criteria Updated',   bg: 'bg-[#FFF8E1] text-[#E65100]',  border: 'border-[var(--color-warning)]' },
+  restriction_added: { label: 'Restriction Added',  bg: 'bg-[#FFEBEE] text-[#C62828]',  border: 'border-[var(--color-error)]' },
+  new_coverage:      { label: 'New Coverage',        bg: 'bg-[#EDF7ED] text-[#2E7D32]', border: 'border-[var(--color-success)]' },
+  coverage_expanded: { label: 'Coverage Expanded',  bg: 'bg-[#E3F2FD] text-[#1565C0]', border: 'border-[var(--color-primary-soft)]' },
+  coverage_removed:  { label: 'Coverage Removed',   bg: 'bg-[#F3E5F5] text-[#6A1B9A]', border: 'border-purple-400' },
 }
 
 function dbRowToCard(row, i) {
@@ -36,9 +34,9 @@ export default function PolicyTimeline() {
 
   useEffect(() => {
     setLoading(true)
-    axios.get(`${API}/policy-changes`, { params: { limit: 50 } })
-      .then(res => {
-        const rows = res.data || []
+    getPolicyChanges({ limit: 50 })
+      .then(data => {
+        const rows = data || []
         setChanges(rows.map(dbRowToCard))
       })
       .catch(() => setChanges([]))
@@ -104,18 +102,18 @@ function ChangeCard({ change }) {
           <p className="theme-muted text-xs">{change.change_date}</p>
         </div>
       </div>
-      <p className="text-gray-300 text-sm mb-3">{change.summary}</p>
-      <div className="bg-white rounded-lg p-3">
+      <p className="text-[var(--color-text)] text-sm mb-3">{change.summary}</p>
+      <div className="bg-[var(--color-surface-soft)] rounded-lg p-3">
         <p className="theme-muted text-xs mb-2">{change.details.field_changed}</p>
         <div className="flex gap-3 text-xs">
           <div className="flex-1">
-            <p className="text-red-400 mb-1">Before:</p>
+            <p className="text-[var(--color-error)] mb-1">Before:</p>
             <p className="theme-muted">{change.details.old_value}</p>
           </div>
-          <div className="text-gray-600 self-center text-lg">&rarr;</div>
+          <div className="theme-muted self-center text-lg">&rarr;</div>
           <div className="flex-1">
-            <p className="text-green-400 mb-1">After:</p>
-            <p className="text-gray-300">{change.details.new_value}</p>
+            <p className="text-[var(--color-success)] mb-1">After:</p>
+            <p className="text-[var(--color-text)]">{change.details.new_value}</p>
           </div>
         </div>
       </div>
@@ -130,7 +128,7 @@ function FilterSelect({ label, value, onChange, options, displayFn }) {
       <select
         value={value}
         onChange={e => onChange(e.target.value)}
-        className="theme-card border border-[var(--color-border)] text-gray-300 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-[var(--color-accent)]"
+        className="theme-card border border-[var(--color-border)] text-[var(--color-text)] text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-[var(--color-accent)]"
       >
         {options.map(opt => (
           <option key={opt} value={opt}>{displayFn ? displayFn(opt) : opt}</option>

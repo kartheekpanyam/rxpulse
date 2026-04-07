@@ -1,12 +1,54 @@
-import { useState, useRef, useEffect } from 'react'
-import axios from 'axios'
-
-const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1'
+import { useState, useRef, useEffect, useCallback } from 'react'
+import { getDrugsList, askQuestion } from '../../api'
 
 const INITIAL_MESSAGE = {
   role: 'assistant',
   text: "Hi! I'm RxPulse AI. I can answer questions about the medical benefit drug policies that have been uploaded to this system — coverage criteria, prior authorization requirements, step therapy, site-of-care restrictions, and how policies differ across payers. What would you like to know?",
   sources: [],
+}
+
+/* ── Voice helpers (free browser APIs) ── */
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+const synth = window.speechSynthesis
+
+function speak(text) {
+  if (!synth) return
+  synth.cancel()
+  const cleaned = text.replace(/\*\*(.*?)\*\*/g, '$1').replace(/#{1,6}\s+/g, '').replace(/[*_`~]/g, '')
+  const utterance = new SpeechSynthesisUtterance(cleaned)
+  utterance.rate = 1.05
+  utterance.pitch = 1
+  utterance.lang = 'en-US'
+  synth.speak(utterance)
+}
+
+function useVoiceInput(onResult) {
+  const [listening, setListening] = useState(false)
+  const recogRef = useRef(null)
+
+  const toggle = useCallback(() => {
+    if (!SpeechRecognition) return
+    if (listening) {
+      recogRef.current?.stop()
+      setListening(false)
+      return
+    }
+    const recog = new SpeechRecognition()
+    recog.lang = 'en-US'
+    recog.interimResults = false
+    recog.maxAlternatives = 1
+    recog.onresult = (e) => {
+      const transcript = e.results[0][0].transcript
+      onResult(transcript)
+    }
+    recog.onend = () => setListening(false)
+    recog.onerror = () => setListening(false)
+    recogRef.current = recog
+    recog.start()
+    setListening(true)
+  }, [listening, onResult])
+
+  return { listening, toggle, supported: !!SpeechRecognition }
 }
 
 function loadChat() {
@@ -25,13 +67,16 @@ export default function ChatInterface() {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [starterQuestions, setStarterQuestions] = useState([])
+  const [speakingIdx, setSpeakingIdx] = useState(null)
   const messagesEndRef = useRef(null)
+
+  const voice = useVoiceInput(useCallback((transcript) => setInput(prev => prev + transcript), []))
 
   // Build starter questions from actual data
   useEffect(() => {
-    axios.get(`${API}/drugs/list`)
-      .then(res => {
-        const drugs = res.data || []
+    getDrugsList()
+      .then(data => {
+        const drugs = data || []
         const starters = []
         // Find a drug with multiple payers
         const multiPayer = drugs.find(d => d.payer_count > 1)
@@ -73,7 +118,7 @@ export default function ChatInterface() {
     setLoading(true)
 
     try {
-      const { data } = await axios.post(`${API}/qa/ask`, { question })
+      const data = await askQuestion(question)
       setMessages(prev => [...prev, {
         role: 'assistant',
         text: data.answer,
@@ -115,7 +160,25 @@ export default function ChatInterface() {
                 : 'theme-card text-[var(--color-text)]'
             }`}>
               {msg.role === 'assistant' && (
-                <p className="text-[var(--color-primary)] text-xs font-medium mb-1">RxPulse AI</p>
+                <div className="flex items-center justify-between mb-1">
+                  <p className="text-[var(--color-primary)] text-xs font-medium">RxPulse AI</p>
+                  {synth && i > 0 && (
+                    <button
+                      onClick={() => {
+                        if (speakingIdx === i) { synth.cancel(); setSpeakingIdx(null) }
+                        else { speak(msg.text); setSpeakingIdx(i) }
+                      }}
+                      className="text-[var(--color-primary-soft)] hover:text-[var(--color-primary)] transition-colors ml-2"
+                      title={speakingIdx === i ? 'Stop speaking' : 'Read aloud'}
+                    >
+                      {speakingIdx === i ? (
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
+                      ) : (
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+                      )}
+                    </button>
+                  )}
+                </div>
               )}
               <div className="text-sm whitespace-pre-wrap">{msg.text}</div>
               {msg.sources && msg.sources.length > 0 && (
@@ -155,14 +218,29 @@ export default function ChatInterface() {
         </div>
       )}
 
-      <div className="px-6 py-4 border-t border-[var(--color-border)] flex gap-3">
+      <div className="px-6 py-4 border-t border-[var(--color-border)] flex gap-2">
         <input
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && ask(input)}
-          placeholder="Ask about drug policies, PA criteria, site-of-care..."
-          className="theme-input flex-1 rounded-xl px-4 py-2.5 text-sm"
+          placeholder={voice.listening ? 'Listening...' : 'Ask about drug policies, PA criteria, site-of-care...'}
+          className={`theme-input flex-1 rounded-xl px-4 py-2.5 text-sm ${voice.listening ? 'ring-2 ring-red-400' : ''}`}
         />
+        {voice.supported && (
+          <button onClick={voice.toggle}
+            className={`px-3 py-2.5 rounded-xl text-sm transition-colors ${
+              voice.listening
+                ? 'bg-red-500 text-white animate-pulse'
+                : 'theme-button-secondary'
+            }`}
+            title={voice.listening ? 'Stop listening' : 'Voice input'}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+          </button>
+        )}
         <button onClick={() => ask(input)} disabled={loading}
           className="theme-button-primary disabled:opacity-50 px-5 py-2.5 rounded-xl text-sm font-medium transition-colors">
           Ask
