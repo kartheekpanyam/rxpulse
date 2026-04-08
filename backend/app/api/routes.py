@@ -851,7 +851,7 @@ def extract_drug_coverages_from_document(document_id: str) -> List[DrugCoverageR
 
 
 # ---------------------------------------------------------------------------
-# Approval Scoring System (inspired by PolicyDiff)
+# Approval Scoring System
 # ---------------------------------------------------------------------------
 
 class ApprovalScoreRequest(BaseModel):
@@ -962,7 +962,7 @@ def compute_approval_score(payload: ApprovalScoreRequest) -> ApprovalScoreRespon
 
 
 # ---------------------------------------------------------------------------
-# Knowledge Graph Data (inspired by RxRefactor)
+# Knowledge Graph Data
 # ---------------------------------------------------------------------------
 
 @router.get("/knowledge-graph")
