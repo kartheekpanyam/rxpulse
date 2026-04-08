@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from datetime import date
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -141,6 +144,8 @@ def list_documents(plan_id: Optional[str] = None) -> List[DocumentRead]:
 # Simplified upload: full pipeline (Task 4 + 5)
 # ---------------------------------------------------------------------------
 
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+
 @router.post("/upload", response_model=UploadJobStatus, status_code=202)
 async def upload_policy_pdf(file: UploadFile = File(...)) -> UploadJobStatus:
     """Queue the full pipeline in the background and return a job id immediately."""
@@ -148,6 +153,10 @@ async def upload_policy_pdf(file: UploadFile = File(...)) -> UploadJobStatus:
         raise HTTPException(status_code=400, detail="Please upload a PDF file.")
 
     file_bytes = await file.read()
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 50MB.")
+    if len(file_bytes) < 100:
+        raise HTTPException(status_code=400, detail="File appears empty or corrupted.")
     manager = get_upload_job_manager()
     job = manager.create_job(file.filename)
     manager.submit(job["job_id"], _process_uploaded_policy_bytes, file.filename, file_bytes)
@@ -168,6 +177,10 @@ async def upload_policy_pdf_sync(file: UploadFile = File(...)) -> UploadResult:
     """Synchronous fallback for operator use on small PDFs."""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file.")
+    # Read and validate
+    file_bytes_preview = await file.read()
+    if len(file_bytes_preview) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 50MB.")
 
     file_bytes = await file.read()
     return _process_uploaded_policy_bytes(file.filename, file_bytes)
@@ -255,8 +268,8 @@ def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progres
             if emb:
                 chunk["embedding"] = emb
         supabase.save_chunks(document_id, tagged_chunks)
-    except Exception:
-        pass  # Non-fatal — RAG degrades gracefully
+    except Exception as exc:
+        logger.warning("Embedding/chunk save failed (RAG will use keyword fallback): %s", exc)
 
     # 8b. Verify extraction with second pass (multi-model verification)
     _report("extracting", "Verifying extraction accuracy...")

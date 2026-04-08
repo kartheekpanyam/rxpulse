@@ -47,6 +47,13 @@ function App() {
           <Route path="/graph" element={<GraphView />} />
           <Route path="/changes" element={<PolicyTimeline />} />
           <Route path="/ask" element={<AskView />} />
+          <Route path="*" element={
+            <div className="max-w-3xl mx-auto px-6 py-16 text-center">
+              <p className="text-6xl font-bold text-[var(--color-primary-deep)] mb-4">404</p>
+              <p className="theme-muted mb-6">Page not found</p>
+              <a href="/" className="theme-button-primary px-6 py-2.5 rounded-xl text-sm font-medium">Back to Dashboard</a>
+            </div>
+          } />
         </Routes>
       </div>
     </BrowserRouter>
