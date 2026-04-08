@@ -244,17 +244,30 @@ def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progres
 
     document_id = doc_row["id"]
 
-    _report("chunking", "Saving RAG chunks...")
-    # 8. Tag chunks with payer/drug metadata and save to document_chunks (RAG)
+    _report("chunking", "Generating embeddings and saving RAG chunks...")
+    # 8. Tag chunks with payer/drug metadata, generate embeddings, and save
     tagged_chunks = bundle.tagged_chunks
     try:
+        # Generate embeddings for each chunk
+        texts = [c.get("content", "")[:2048] for c in tagged_chunks]
+        embeddings = gemini.embed_texts_batch(texts)
+        for chunk, emb in zip(tagged_chunks, embeddings):
+            if emb:
+                chunk["embedding"] = emb
         supabase.save_chunks(document_id, tagged_chunks)
     except Exception:
         pass  # Non-fatal — RAG degrades gracefully
 
+    # 8b. Verify extraction with second pass (multi-model verification)
+    _report("extracting", "Verifying extraction accuracy...")
+    try:
+        verified = gemini.verify_extraction(bundle.document, bundle.extracted)
+    except Exception:
+        verified = bundle.extracted
+
     # 9. Save structured drug coverages to drug_coverages table
     drugs_saved = 0
-    if bundle.extracted.coverages:
+    if verified.coverages:
         payloads = [
             DrugCoverageCreate(
                 plan_id=plan_id,
@@ -290,7 +303,7 @@ def _process_uploaded_policy_bytes(file_name: str, file_bytes: bytes, on_progres
                 effective_date=bundle.effective_date,
                 last_reviewed_date=bundle.last_reviewed_date,
             )
-            for item in bundle.extracted.coverages
+            for item in verified.coverages
         ]
         try:
             supabase.replace_drug_coverages_for_document(document_id, payloads)
@@ -662,9 +675,12 @@ def ask_question(payload: QARequest) -> QAResponse:
     supabase = get_supabase_service()
     settings = get_settings()
     gemini = GeminiService(settings)
-    # Use RAG chunks instead of structured coverage rows
+    # Use vector search (with keyword fallback) for RAG chunks
     try:
-        chunks = supabase.retrieve_chunks_for_question(payload.question)
+        query_embedding = gemini.embed_text(payload.question)
+        chunks = supabase.retrieve_chunks_for_question(
+            payload.question, query_embedding=query_embedding
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     try:

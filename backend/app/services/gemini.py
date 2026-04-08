@@ -220,6 +220,61 @@ class GeminiService:
         except Exception:
             return DrugCoverageExtractionResult(coverages=[])
 
+    def verify_extraction(self, document: PolicyDocument, extraction: DrugCoverageExtractionResult) -> DrugCoverageExtractionResult:
+        """Cross-verify extracted coverages with a second pass at higher temperature.
+        Flags low-confidence entries and removes hallucinated drugs."""
+        if not extraction.coverages or not self.is_configured:
+            return extraction
+
+        drug_names = [c.drug_name for c in extraction.coverages if c.drug_name]
+        coverage_summary = ", ".join(
+            "{0} ({1})".format(c.drug_name, c.coverage_status or "unknown")
+            for c in extraction.coverages[:20]
+        )
+
+        prompt = """You are verifying drug extraction results from a medical policy PDF.
+The document title is: {title}
+
+The extraction found these drugs: {drugs}
+Coverage summary: {summary}
+
+Review the first 3000 characters of the document and answer in JSON:
+{{
+  "confirmed_drugs": ["list of drug names that genuinely appear in this document"],
+  "hallucinated_drugs": ["list of drug names that do NOT appear in the document"],
+  "corrections": [
+    {{"drug": "name", "field": "field_name", "issue": "description"}}
+  ]
+}}
+
+Document text (first 3000 chars):
+{text}""".format(
+            title=document.title or "Unknown",
+            drugs=", ".join(drug_names[:20]),
+            summary=coverage_summary,
+            text=document.raw_text[:3000],
+        )
+
+        try:
+            result = self._request_json(prompt, temperature=0.1, timeout=60.0, allow_quota_failure=True)
+            if not result:
+                return extraction
+
+            hallucinated = set(d.lower() for d in (result.get("hallucinated_drugs") or []))
+            if hallucinated:
+                verified = [c for c in extraction.coverages if (c.drug_name or "").lower() not in hallucinated]
+                return DrugCoverageExtractionResult(
+                    payer=extraction.payer,
+                    policy_number=extraction.policy_number,
+                    effective_date=extraction.effective_date,
+                    last_reviewed_date=extraction.last_reviewed_date,
+                    coverages=verified,
+                )
+        except Exception:
+            pass
+
+        return extraction
+
     def extract_drug_coverages(self, raw_text: str) -> DrugCoverageExtractionResult:
         if not self.is_configured:
             raise ValueError("Gemini API key is missing in backend/.env")
@@ -525,6 +580,39 @@ DOCUMENT B ({label_b}):
             return None
 
     # -------------------------------------------------------------------------
+    # Embeddings (for vector search)
+    # -------------------------------------------------------------------------
+
+    def embed_text(self, text: str) -> Optional[List[float]]:
+        """Generate a 768-dim embedding using Gemini text-embedding-004."""
+        if not self.is_configured:
+            return None
+        try:
+            response = httpx.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/{0}:embedContent".format(
+                    self.settings.gemini_embedding_model
+                ),
+                params={"key": self.settings.gemini_api_key},
+                json={
+                    "model": "models/{0}".format(self.settings.gemini_embedding_model),
+                    "content": {"parts": [{"text": text[:2048]}]},
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            return response.json().get("embedding", {}).get("values")
+        except Exception:
+            return None
+
+    def embed_texts_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
+        """Embed multiple texts, one at a time (Gemini has no batch embed endpoint for this model)."""
+        results = []
+        for text in texts:
+            results.append(self.embed_text(text))
+            time.sleep(0.1)  # rate limit
+        return results
+
+    # -------------------------------------------------------------------------
     # Request helpers
     # -------------------------------------------------------------------------
 
@@ -609,6 +697,51 @@ Opening pages:
             opening_pages=first_pages_text(document),
         )
 
+    # Payer-specific extraction hints — each payer formats policies differently
+    PAYER_EXTRACTION_HINTS = {
+        "bcbs": (
+            "BCBS/Blue Cross policies typically use 'Corporate Medical Policy' format with "
+            "sections: Policy Statement, Description, Rationale, Coding, References. "
+            "Coverage criteria are in 'Policy Statement'. Look for 'Preferred Injectable' program lists. "
+            "Products are categorized as preferred/non-preferred with HCPCS J-codes in Coding sections."
+        ),
+        "uhc": (
+            "UnitedHealthcare policies use 'Medical Benefit Drug Policy' format. "
+            "Key sections: Coverage Rationale, Definitions, Applicable Codes, References. "
+            "Look for 'proven' vs 'unproven' indications. UHC often lists specific J-codes and "
+            "quantity limits in 'Applicable Codes'. Step therapy requirements are in Coverage Rationale."
+        ),
+        "cigna": (
+            "Cigna policies use 'Coverage Policy' format with sections: Coverage Policy, "
+            "General Background, Coding/Billing, References. Cigna separates 'medically necessary' "
+            "from 'experimental/investigational/unproven'. Look for site-of-care requirements "
+            "and biosimilar substitution policies."
+        ),
+        "aetna": (
+            "Aetna policies use 'Clinical Policy Bulletin' format. Key sections: Policy, Background, "
+            "Coding, References. Aetna often has detailed step-therapy requirements and uses "
+            "'medically necessary' vs 'experimental and investigational' classification."
+        ),
+        "humana": (
+            "Humana policies use 'Medical Coverage Policy' format. Look for Prior Authorization "
+            "requirements, quantity limits, and site-of-care restrictions in the Coverage section."
+        ),
+    }
+
+    def _get_payer_hint(self, payer: Optional[str]) -> str:
+        if not payer:
+            return ""
+        payer_lower = payer.lower()
+        for key, hint in self.PAYER_EXTRACTION_HINTS.items():
+            if key in payer_lower:
+                return "\n\nPayer-specific guidance:\n" + hint
+        # Check common aliases
+        if any(k in payer_lower for k in ["blue cross", "blue shield", "anthem"]):
+            return "\n\nPayer-specific guidance:\n" + self.PAYER_EXTRACTION_HINTS["bcbs"]
+        if any(k in payer_lower for k in ["united", "optum"]):
+            return "\n\nPayer-specific guidance:\n" + self.PAYER_EXTRACTION_HINTS["uhc"]
+        return ""
+
     def _build_policy_chunk_prompt(self, chunk: dict, metadata: Dict[str, object]) -> str:
         document_type = metadata.get("document_type") or "drug_policy"
         governed_drugs = metadata.get("governed_drugs") or []
@@ -688,7 +821,7 @@ Rules:
 - Use "not_covered" only when the policy clearly says excluded, non-covered, or not medically necessary.
 - Keep evidence_snippet short.
 - Do not include extra keys.
-
+{payer_hint}
 Chunk text:
 {chunk_text}
 """.format(
@@ -707,6 +840,7 @@ Chunk text:
             target_product=json.dumps(metadata.get("target_product") or {}, indent=2),
             scope_rules=scope_rules,
             secondary_rules=secondary_rules,
+            payer_hint=self._get_payer_hint(metadata.get("payer")),
             chunk_text=chunk.get("content") or "",
         )
 

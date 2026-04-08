@@ -199,14 +199,15 @@ class SupabaseService:
     # -------------------------------------------------------------------------
 
     def save_chunks(self, document_id: str, chunks: List[Dict]) -> None:
-        """Store tagged chunks for RAG retrieval."""
+        """Store tagged chunks for RAG retrieval (with embeddings if available)."""
         if not chunks:
             return
         # Delete old chunks for this doc first
         self._request("DELETE", "/rest/v1/document_chunks", headers={"Prefer": "return=minimal"},
                       params={"document_id": "eq.{0}".format(document_id)})
-        rows = [
-            {
+        rows = []
+        for c in chunks:
+            row = {
                 "document_id": document_id,
                 "chunk_index": c["chunk_index"],
                 "content": c["content"],
@@ -216,15 +217,39 @@ class SupabaseService:
                 "page_number": c.get("page_number"),
                 "metadata": c.get("metadata") or {},
             }
-            for c in chunks
-        ]
+            if c.get("embedding"):
+                row["embedding"] = c["embedding"]
+            rows.append(row)
         # Insert in batches of 50
         for i in range(0, len(rows), 50):
             batch = rows[i:i + 50]
             self._request("POST", "/rest/v1/document_chunks", headers={"Prefer": "return=minimal"}, json=batch)
 
-    def retrieve_chunks_for_question(self, question: str, limit: int = 12) -> List[Dict]:
-        """Retrieve relevant chunks for a natural language question using keyword matching."""
+    def retrieve_chunks_vector(self, query_embedding: List[float], limit: int = 12) -> List[Dict]:
+        """Retrieve chunks using pgvector similarity search via Supabase RPC."""
+        try:
+            result = self._request("POST", "/rest/v1/rpc/match_chunks", json={
+                "query_embedding": query_embedding,
+                "match_count": limit,
+            }).json()
+            if result and isinstance(result, list) and len(result) > 0:
+                return result
+        except Exception:
+            pass
+        return []
+
+    def retrieve_chunks_for_question(self, question: str, limit: int = 12, query_embedding: Optional[List[float]] = None) -> List[Dict]:
+        """Retrieve relevant chunks — tries vector search first, falls back to keyword matching."""
+
+        # 1) Try vector search if embedding is provided
+        if query_embedding:
+            vector_results = self.retrieve_chunks_vector(query_embedding, limit)
+            if vector_results:
+                vector_results = self._filter_to_latest_chunk_rows(vector_results)
+                if len(vector_results) >= 3:
+                    return vector_results[:limit]
+
+        # 2) Keyword fallback
         stop = {"what", "which", "does", "cover", "the", "for", "and", "plan", "plans",
                 "drug", "require", "criteria", "prior", "auth", "authorization", "how",
                 "differ", "between", "payer", "payers", "policy", "policies", "medical",
@@ -234,7 +259,6 @@ class SupabaseService:
         seen_ids: set = set()
         rows: List[Dict] = []
 
-        # Search by tagged drug_name and chunk content keywords
         for token in tokens[:5]:
             drug_rows = self._request("GET", "/rest/v1/document_chunks", params={
                 "select": "*",
@@ -246,7 +270,6 @@ class SupabaseService:
                     rows.append(r)
                     seen_ids.add(r.get("id"))
 
-            # Then content match
             content_rows = self._request("GET", "/rest/v1/document_chunks", params={
                 "select": "*",
                 "content": "ilike.*{0}*".format(token),
@@ -257,7 +280,6 @@ class SupabaseService:
                     rows.append(r)
                     seen_ids.add(r.get("id"))
 
-        # Prioritize rows where the chunk metadata carries stronger drug or policy signals.
         rows = self._filter_to_latest_chunk_rows(rows)
         rows.sort(key=lambda r: (
             0 if r.get("section_type") != "general" else 1,
