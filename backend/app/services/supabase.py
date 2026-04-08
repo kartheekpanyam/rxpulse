@@ -238,16 +238,49 @@ class SupabaseService:
             pass
         return []
 
+    def _ensure_payer_diversity(self, rows: List[Dict], limit: int) -> List[Dict]:
+        """Ensure chunks from ALL payers are represented, not just the most matched one.
+        Distributes slots evenly across payers so no single payer dominates."""
+        if not rows:
+            return rows
+        # Group by payer
+        by_payer: Dict[str, List[Dict]] = {}
+        for r in rows:
+            payer = r.get("payer") or "Unknown"
+            by_payer.setdefault(payer, []).append(r)
+
+        if len(by_payer) <= 1:
+            return rows[:limit]
+
+        # Round-robin: give each payer fair share
+        per_payer = max(3, limit // len(by_payer))
+        result = []
+        for payer, payer_rows in by_payer.items():
+            result.extend(payer_rows[:per_payer])
+
+        # Fill remaining slots with best unused chunks
+        used_ids = {r.get("id") for r in result}
+        for r in rows:
+            if len(result) >= limit:
+                break
+            if r.get("id") not in used_ids:
+                result.append(r)
+                used_ids.add(r.get("id"))
+
+        return result[:limit]
+
     def retrieve_chunks_for_question(self, question: str, limit: int = 12, query_embedding: Optional[List[float]] = None) -> List[Dict]:
-        """Retrieve relevant chunks — tries vector search first, falls back to keyword matching."""
+        """Retrieve relevant chunks — tries vector search first, falls back to keyword matching.
+        Ensures payer diversity so all payers are represented in results."""
 
         # 1) Try vector search if embedding is provided
         if query_embedding:
-            vector_results = self.retrieve_chunks_vector(query_embedding, limit)
+            # Fetch more than needed so we can ensure diversity
+            vector_results = self.retrieve_chunks_vector(query_embedding, limit * 2)
             if vector_results:
                 vector_results = self._filter_to_latest_chunk_rows(vector_results)
                 if len(vector_results) >= 3:
-                    return vector_results[:limit]
+                    return self._ensure_payer_diversity(vector_results, limit)
 
         # 2) Keyword fallback
         stop = {"what", "which", "does", "cover", "the", "for", "and", "plan", "plans",
@@ -263,7 +296,7 @@ class SupabaseService:
             drug_rows = self._request("GET", "/rest/v1/document_chunks", params={
                 "select": "*",
                 "drug_name": "ilike.*{0}*".format(token),
-                "limit": "10",
+                "limit": "15",
             }).json()
             for r in drug_rows:
                 if r.get("id") not in seen_ids:
@@ -273,7 +306,7 @@ class SupabaseService:
             content_rows = self._request("GET", "/rest/v1/document_chunks", params={
                 "select": "*",
                 "content": "ilike.*{0}*".format(token),
-                "limit": "10",
+                "limit": "15",
             }).json()
             for r in content_rows:
                 if r.get("id") not in seen_ids:
@@ -288,11 +321,11 @@ class SupabaseService:
 
         if not rows:
             rows = self._request("GET", "/rest/v1/document_chunks", params={
-                "select": "*", "order": "created_at.desc", "limit": str(limit),
+                "select": "*", "order": "created_at.desc", "limit": str(limit * 2),
             }).json()
             rows = self._filter_to_latest_chunk_rows(rows)
 
-        return rows[:limit]
+        return self._ensure_payer_diversity(rows, limit)
 
     # -------------------------------------------------------------------------
     # Policy changes (persistent diffs)

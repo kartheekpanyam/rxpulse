@@ -427,9 +427,23 @@ Document text (first 3000 chars):
     # RAG question answering
     # -------------------------------------------------------------------------
 
+    _GREETING_WORDS = {"hello", "hi", "hey", "howdy", "greetings", "sup", "yo", "hola", "thanks", "thank you", "bye", "goodbye"}
+
+    def _is_greeting(self, question: str) -> bool:
+        cleaned = question.strip().rstrip("!?.").lower()
+        return cleaned in self._GREETING_WORDS or len(cleaned.split()) <= 2 and cleaned.split()[0] in self._GREETING_WORDS
+
     def ask_question_rag(self, question: str, chunks: List[Dict]) -> dict:
         if not self.is_configured:
             raise ValueError("Gemini API key is missing in backend/.env")
+
+        # Handle greetings and non-policy questions
+        if self._is_greeting(question):
+            return {
+                "answer": "Hi! I'm RxPulse AI. Ask me anything about the medical benefit drug policies in this system — coverage criteria, prior authorization, step therapy, biosimilar requirements, site-of-care restrictions, and more.",
+                "sources": [],
+                "drugs_found": [],
+            }
 
         if not chunks:
             return {
@@ -454,17 +468,23 @@ Document text (first 3000 chars):
             if section != "general":
                 header += " | Section: {section}".format(section=section)
 
-            context_parts.append("{0}\n{1}".format(header, content[:2000]))
+            context_parts.append("{0}\n{1}".format(header, content[:2500]))
             sources.add(payer)
             if drug:
                 drugs_found.add(drug)
 
         prompt = """You are RxPulse, a medical benefit drug policy assistant for healthcare analysts.
 Answer the question using ONLY the policy text provided below.
-Always cite the specific payer name in your answer.
-Be concise and specific. Use bullet points when comparing multiple payers.
-Do not use markdown bold (**) or headers - plain text only.
-If the data does not contain enough information, say so clearly - never invent coverage rules.
+
+CRITICAL RULES:
+1. Always cite the specific payer name (e.g., "According to Cigna..." or "BCBS NC requires...").
+2. Be EXHAUSTIVE — list ALL criteria, ALL biosimilars, ALL required conditions. Never summarize with "such as" or "including" when you can list every item.
+3. When a question asks about specific requirements, list each one as a numbered item.
+4. If multiple payers have relevant data, answer for EACH payer separately.
+5. If the policy text mentions specific section numbers, reference them.
+6. Do not confuse one payer's criteria with another — each payer section is labeled with [Payer Name].
+7. If the provided text does not contain information to answer the question, say "The uploaded policies do not contain information about this topic" — do not guess or use general medical knowledge.
+8. Do not use markdown bold (**) or headers — plain text only.
 
 Policy text:
 {context}
@@ -472,7 +492,7 @@ Policy text:
 Question: {question}""".format(context="\n\n---\n\n".join(context_parts), question=question)
 
         try:
-            answer = self._request_text(prompt, temperature=0.2, timeout=self.REQUEST_TIMEOUT_SECONDS)
+            answer = self._request_text(prompt, temperature=0.1, timeout=self.REQUEST_TIMEOUT_SECONDS)
         except Exception as exc:
             answer = "Error generating answer: {0}".format(str(exc))
 
