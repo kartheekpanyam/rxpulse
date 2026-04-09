@@ -26,6 +26,9 @@ class Settings:
     gemini_embedding_model: str
     supabase_url: str
     supabase_key: str
+    use_vertex_ai: bool = False
+    gcp_project_id: str = ""
+    gcp_region: str = "us-central1"
 
 
 def _to_bool(value: Optional[str], default: bool = False) -> bool:
@@ -49,4 +52,7 @@ def get_settings() -> Settings:
         ),
         supabase_url=os.getenv("SUPABASE_URL", "").strip(),
         supabase_key=os.getenv("SUPABASE_KEY", "").strip(),
+        use_vertex_ai=_to_bool(os.getenv("USE_VERTEX_AI"), default=False),
+        gcp_project_id=os.getenv("GCP_PROJECT_ID", "").strip(),
+        gcp_region=os.getenv("GCP_REGION", "us-central1").strip(),
     )

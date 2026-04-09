@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import Dict, List, Optional, Union
@@ -8,6 +9,30 @@ from typing import Dict, List, Optional, Union
 import httpx
 
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
+
+
+def _get_vertex_access_token() -> str:
+    """Get OAuth2 access token for Vertex AI using Cloud Run's default service account."""
+    try:
+        import google.auth
+        import google.auth.transport.requests
+        credentials, _ = google.auth.default()
+        credentials.refresh(google.auth.transport.requests.Request())
+        return credentials.token
+    except Exception:
+        # Fallback: try metadata server (works on Cloud Run)
+        try:
+            resp = httpx.get(
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+                headers={"Metadata-Flavor": "Google"},
+                timeout=5.0,
+            )
+            return resp.json()["access_token"]
+        except Exception as exc:
+            logger.error("Failed to get Vertex AI access token: %s", exc)
+            raise
 from app.schemas.drug_coverage import DrugCoverageExtractionResult
 from app.services.pdf_policy_parser import (
     PolicyDocument,
@@ -608,20 +633,27 @@ DOCUMENT B ({label_b}):
         if not self.is_configured:
             return None
         try:
-            response = httpx.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/{0}:embedContent".format(
-                    self.settings.gemini_embedding_model
-                ),
-                params={"key": self.settings.gemini_api_key},
-                json={
+            headers, params = self._build_headers_and_params()
+            if self.settings.use_vertex_ai:
+                url = self._build_url(self.settings.gemini_embedding_model, "predict")
+                body = {"instances": [{"content": text[:2048]}]}
+            else:
+                url = self._build_url(self.settings.gemini_embedding_model, "embedContent")
+                body = {
                     "model": "models/{0}".format(self.settings.gemini_embedding_model),
                     "content": {"parts": [{"text": text[:2048]}]},
-                },
-                timeout=30.0,
-            )
+                }
+            response = httpx.post(url, headers=headers, params=params, json=body, timeout=30.0)
             response.raise_for_status()
-            return response.json().get("embedding", {}).get("values")
-        except Exception:
+            data = response.json()
+            if self.settings.use_vertex_ai:
+                predictions = data.get("predictions") or []
+                if predictions:
+                    return predictions[0].get("embeddings", {}).get("values")
+                return None
+            return data.get("embedding", {}).get("values")
+        except Exception as exc:
+            logger.warning("Embedding failed: %s", exc)
             return None
 
     def embed_texts_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
@@ -633,15 +665,31 @@ DOCUMENT B ({label_b}):
         return results
 
     # -------------------------------------------------------------------------
-    # Request helpers
+    # Request helpers (supports both Gemini free API and Vertex AI)
     # -------------------------------------------------------------------------
 
+    def _build_url(self, model: str, method: str = "generateContent") -> str:
+        if self.settings.use_vertex_ai:
+            return "https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:{method}".format(
+                region=self.settings.gcp_region,
+                project=self.settings.gcp_project_id,
+                model=model,
+                method=method,
+            )
+        return "https://generativelanguage.googleapis.com/v1beta/models/{0}:{1}".format(model, method)
+
+    def _build_headers_and_params(self) -> tuple:
+        if self.settings.use_vertex_ai:
+            token = _get_vertex_access_token()
+            return {"Authorization": "Bearer {0}".format(token), "Content-Type": "application/json"}, {}
+        return {"Content-Type": "application/json"}, {"key": self.settings.gemini_api_key}
+
     def _request_text(self, prompt: str, temperature: float, timeout: float) -> str:
+        headers, params = self._build_headers_and_params()
         response = httpx.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/{0}:generateContent".format(
-                self.settings.gemini_model
-            ),
-            params={"key": self.settings.gemini_api_key},
+            self._build_url(self.settings.gemini_model),
+            headers=headers,
+            params=params,
             json={
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": temperature},
@@ -652,12 +700,12 @@ DOCUMENT B ({label_b}):
         return self._extract_response_text(response.json())
 
     def _request_json(self, prompt: str, temperature: float, timeout: float, allow_quota_failure: bool = False) -> Dict:
+        headers, params = self._build_headers_and_params()
         try:
             response = httpx.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/{0}:generateContent".format(
-                    self.settings.gemini_model
-                ),
-                params={"key": self.settings.gemini_api_key},
+                self._build_url(self.settings.gemini_model),
+                headers=headers,
+                params=params,
                 json={
                     "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                     "generationConfig": {
