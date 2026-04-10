@@ -177,12 +177,12 @@ async def upload_policy_pdf_sync(file: UploadFile = File(...)) -> UploadResult:
     """Synchronous fallback for operator use on small PDFs."""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file.")
-    # Read and validate
-    file_bytes_preview = await file.read()
-    if len(file_bytes_preview) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File too large. Maximum size is 50MB.")
 
     file_bytes = await file.read()
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 50MB.")
+    if len(file_bytes) < 100:
+        raise HTTPException(status_code=400, detail="File appears empty or corrupted.")
     return _process_uploaded_policy_bytes(file.filename, file_bytes)
 
 
